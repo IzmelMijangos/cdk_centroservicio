@@ -8,3 +8,20 @@ __pycache__
 # CDK asset staging directory
 .cdk.staging
 cdk.out
+
+
+# Ignore CDK build and deployment artifacts
+cdk.out/
+cdk.context.json
+.cdk.staging/
+.cdk.toml
+
+# Ignore Python virtual environment
+venv/
+
+# Ignore Node.js dependencies
+node_modules/
+
+# Ignore operating system and editor generated files
+.DS_Store
+Thumbs.db
