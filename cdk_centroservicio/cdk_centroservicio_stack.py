@@ -14,6 +14,8 @@ from aws_cdk import (
     CfnOutput,
     SecretValue,
     Duration,
+    aws_iam as iam,
+    aws_codestarconnections as codestarconnections
 )
 from constructs import Construct
 
@@ -21,9 +23,6 @@ class CdkCentroservicioStack(Stack):
 
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
-        
-        # Asumiendo que el nombre del secreto es "GitHubTokenSecret"
-        github_token_secret = SecretValue.secrets_manager("GitHubTokenSecret")
         
         # Crear una nueva VPC con subredes públicas y privadas
         vpc = ec2.Vpc(self, "CSVpc",
@@ -33,11 +32,112 @@ class CdkCentroservicioStack(Stack):
                           ec2.SubnetConfiguration(name="Private", subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS )
                       ])
 
-       # ECR Repositories
+        # Define un recurso de AWS CodeStar Connections y obtiene el ARN
+        codestar_connection = codestarconnections.CfnConnection(
+            self, "MyCodeStarConnection",
+            connection_name="MyConnection",
+            provider_type="GitHub",
+        )
+        connection_arn = codestar_connection.attr_connection_arn
+
+        # Crea el repositorio en ECR
         ecr_repository = ecr.Repository(self, "CSEcrRepository")
 
-        # ECS Cluster
-        ecs_cluster = ecs.Cluster(self, "CSCluster")
+        # Fuente del artefacto para el código fuente
+        source_output = codepipeline.Artifact()
+        # Definir un artefacto de salida para la imagen construida
+        build_output = codepipeline.Artifact()
+        
+        # Crear un rol de IAM para CodeBuild con permisos para interactuar con ECR
+        codebuild_role = iam.Role(self, "CodeBuildRole",
+            assumed_by=iam.ServicePrincipal("codebuild.amazonaws.com"),
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name("AmazonEC2ContainerRegistryPowerUser"),
+            ]
+        )
+        
+        # Crear un proyecto de CodeBuild para construir y subir la imagen Docker
+        build_project = codebuild.PipelineProject(self, "BuildProject",
+            build_spec=codebuild.BuildSpec.from_object({
+                'version': '0.2',
+                'phases': {
+                    'pre_build': {
+                        'commands': [
+                            'echo Logging in to Amazon ECR...',
+                            '$(aws ecr get-login --region $AWS_DEFAULT_REGION --no-include-email)',
+                        ]
+                    },
+                    'build': {
+                        'commands': [
+                            'echo Build started on `date`',
+                            'echo Building the Docker image...',
+                            'docker build -t $REPOSITORY_URI:backend -f Dockerfile.back.prod .',
+                        ]
+                    },
+                    'post_build': {
+                        'commands': [
+                            'echo Build completed on `date`',
+                            'echo Pushing the Docker image...',
+                            'docker push $REPOSITORY_URI:backend',
+                            'echo Writing image definitions file...',
+                            'printf \'[{"name":"CSEcrRepository","imageUri":"%s"}]\' $REPOSITORY_URI:backend > imagedefinitions.json',
+                        ]
+                    }
+                },
+                'artifacts': {
+                    'files': ['imagedefinitions.json']
+                },
+                'environment': {
+                    'privileged-mode': True,
+                    'buildImage': codebuild.LinuxBuildImage.STANDARD_5_0,
+                },
+            }),
+            environment_variables={
+                'REPOSITORY_URI': codebuild.BuildEnvironmentVariable(value=ecr_repository.repository_uri)
+            },
+            role=codebuild_role,
+        )
+        # Asegúrate de que el proyecto CodeBuild tenga permisos para interactuar con ECR
+        ecr_repository.grant_pull_push(build_project)
+
+        # Pipeline de CodePipeline
+        pipeline = codepipeline.Pipeline(self, "CSPipeline",
+            stages=[
+                codepipeline.StageProps(
+                    stage_name='Source',
+                    actions=[
+                        codepipeline_actions.CodeStarConnectionsSourceAction(
+                            action_name="GitHub_Source",
+                            owner="IzmelMijangos",
+                            repo="CentroServicioBackend",
+                            branch="master",
+                            connection_arn=connection_arn,
+                            output=source_output,
+                            ),
+                        ]
+                ),
+                codepipeline.StageProps(
+                    stage_name='Build',
+                    actions=[
+                        codepipeline_actions.CodeBuildAction(
+                            action_name='Build',
+                            project=build_project,
+                            input=source_output,
+                            outputs=[build_output],
+                        ),
+                    ]
+                ),
+                codepipeline.StageProps(
+                    stage_name='Mock',
+                    actions=[
+                        codepipeline_actions.ManualApprovalAction(
+                            action_name='Manual_Approval',
+                            run_order=1
+                        )
+                    ]
+                ),
+            ],
+        )
 
         # Crear un secreto para la contraseña de la base de datos
         db_password = sm.Secret(self, "CSDBPassword",
@@ -80,53 +180,3 @@ class CdkCentroservicioStack(Stack):
                 parameter_group_name="default.postgres12"
             ),
         )
-
-        # CodeBuild Project
-        code_build_project = codebuild.PipelineProject(self, "CSProject",
-            project_name="CSProject",
-            environment={
-                "build_image": codebuild.LinuxBuildImage.STANDARD_5_0,
-                "privileged": True,
-            },
-            environment_variables={
-                "ECR_REPOSITORY_URI": codebuild.BuildEnvironmentVariable(value=ecr_repository.repository_uri)
-            }
-        )
-
-        ## Pipeline
-        #source_output = codepipeline.Artifact()
-        #build_output = codepipeline.Artifact()
-
-        #pipeline = codepipeline.Pipeline(self, "CSPipeline",
-        #    pipeline_name="CSPipeline",
-        #    stages=[
-        #        codepipeline.StageProps(
-        #            stage_name="CSSource",
-        #            actions=[
-        #                codepipeline_actions.GitHubSourceAction(
-        #                    action_name="GitHub_Source",
-        #                    owner="IzmelMijangos",
-        #                    repo="https://github.com/IzmelMijangos/CentroServicio.git",
-        #                    oauth_token=SecretValue.secrets_manager("github_token_secret"),
-        #                    output=source_output
-        #                )
-        #            ]
-        #        ),
-        #        codepipeline.StageProps(
-        #            stage_name="CSBuild",
-        #            actions=[
-        #                codepipeline_actions.CodeBuildAction(
-        #                    action_name="Docker_Build",
-        #                    project=code_build_project,
-        #                    input=source_output,
-        #                    outputs=[build_output]
-        #                )
-        #            ]
-        #        ),
-        #        
-        #    ]
-        #)
-        # Salidas
-        CfnOutput(self, "VpcId", value=vpc.vpc_id)
-        CfnOutput(self, "DBAddress", value=db_instance.db_instance_endpoint_address)
-        CfnOutput(self, "DBPort", value=str(db_instance.db_instance_endpoint_port))
